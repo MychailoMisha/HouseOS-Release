@@ -1,0 +1,419 @@
+use crate::clipboard;
+use crate::commands::{self, ConsoleAction, LineType};
+use crate::display::{self, Framebuffer};
+use crate::system;
+use crate::window;
+
+const MAX_LINES: usize = 128;
+const MAX_COLS: usize = 64;
+const LINE_HEIGHT: usize = 16; // Збільшено для кращої читаємості
+const PAD: usize = 14;
+const SCROLL_W: usize = 12;
+
+pub struct Console {
+    visible: bool,
+    fb_w: usize,
+    fb_h: usize,
+    win_x: usize,
+    win_y: usize,
+    win_w: usize,
+    win_h: usize,
+    lines: [[u8; MAX_COLS]; MAX_LINES],
+    lens: [usize; MAX_LINES],
+    types: [LineType; MAX_LINES],
+    count: usize,
+    input: [u8; MAX_COLS],
+    input_len: usize,
+    scroll: usize,
+    action: ConsoleAction,
+    rand_state: u32,
+}
+
+impl Console {
+    pub fn new(fb: Framebuffer) -> Self {
+        let seed = (fb.width as u32) ^ ((fb.height as u32) << 16);
+        Self {
+            visible: false, fb_w: fb.width, fb_h: fb.height,
+            win_x: 0, win_y: 0, win_w: 0, win_h: 0,
+            lines: [[0u8; MAX_COLS]; MAX_LINES],
+            lens: [0usize; MAX_LINES],
+            types: [LineType::Normal; MAX_LINES],
+            count: 0, input: [0u8; MAX_COLS], input_len: 0,
+            scroll: usize::MAX,
+            action: ConsoleAction::None,
+            rand_state: seed ^ 0xA5A5_5A5A,
+        }
+    }
+
+    pub fn is_visible(&self) -> bool { self.visible }
+
+    pub fn show(&mut self, fb: &Framebuffer) {
+        self.visible = true;
+        if self.win_w == 0 {
+            let (x, y, w, h) = calc_rect(fb);
+            (self.win_x, self.win_y, self.win_w, self.win_h) = (x, y, w, h);
+        }
+    }
+
+    pub fn hide(&mut self, _fb: &Framebuffer) { self.visible = false; }
+
+    pub fn handle_click(&mut self, fb: &Framebuffer, x: usize, y: usize) -> bool {
+        if !self.visible { return false; }
+        let (sx, sy, sw, sh, max_scroll) = self.scrollbar_rect(fb);
+        if max_scroll > 0 && x >= sx && x < sx + sw && y >= sy && y < sy + sh {
+            let rel = y.saturating_sub(sy).min(sh.saturating_sub(1));
+            self.scroll = (rel * max_scroll) / sh.max(1);
+            self.redraw(fb);
+        }
+        true
+    }
+
+    pub fn take_action(&mut self) -> ConsoleAction {
+        core::mem::replace(&mut self.action, ConsoleAction::None)
+    }
+
+    pub fn copy_input(&self) {
+        if self.visible && self.input_len > 0 {
+            clipboard::set(&self.input[..self.input_len]);
+        }
+    }
+
+    pub fn paste_clipboard(&mut self, fb: &Framebuffer) -> bool {
+        if !self.visible { return false; }
+        let data = clipboard::data();
+        for &b in data.iter().filter(|&&b| b != b'\n' && b != b'\r') {
+            if self.input_len >= MAX_COLS { break; }
+            self.input[self.input_len] = b;
+            self.input_len += 1;
+        }
+        self.redraw(fb);
+        true
+    }
+
+    pub fn handle_char(&mut self, fb: &Framebuffer, ch: u8) -> bool {
+        if !self.visible { return false; }
+        match ch {
+            b'\n' => self.execute(fb),
+            0x08 => if self.input_len > 0 { self.input_len -= 1; self.redraw(fb); },
+            b'\t' => {},
+            _ if self.input_len < MAX_COLS => {
+                self.input[self.input_len] = ch;
+                self.input_len += 1;
+                self.redraw(fb);
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn execute(&mut self, fb: &Framebuffer) {
+        let len = self.input_len;
+        let cmd = self.input;
+        
+        self.push_prompt_line(&cmd, len);
+        
+        let result = commands::execute_command(&cmd, len, &mut self.rand_state, self.fb_w, self.fb_h);
+        
+        let (head, _) = split_first_word(&cmd, len);
+        if eq_ignore_case(head, b"clear") || eq_ignore_case(head, b"cls") {
+            self.clear();
+        } else {
+            for i in 0..result.count {
+                self.push_line_raw(&result.lines[i], result.lens[i], result.types[i]);
+            }
+        }
+        
+        if result.action != ConsoleAction::None { self.action = result.action; }
+        self.input_len = 0;
+        self.redraw(fb);
+    }
+
+    fn push_prompt_line(&mut self, cmd: &[u8; MAX_COLS], len: usize) {
+        let mut line = [0u8; MAX_COLS];
+        line[0] = b'>';
+        line[1] = b' ';
+        let content_len = (len).min(MAX_COLS - 2);
+        line[2..2 + content_len].copy_from_slice(&cmd[..content_len]);
+        self.push_line_raw(&line, content_len + 2, LineType::Info);
+    }
+
+    fn clear(&mut self) {
+        self.count = 0;
+        self.lens.fill(0);
+        self.scroll = usize::MAX;
+    }
+
+    fn push_line_raw(&mut self, line: &[u8; MAX_COLS], len: usize, line_type: LineType) {
+        if self.count < MAX_LINES {
+            self.lines[self.count] = *line;
+            self.lens[self.count] = len;
+            self.types[self.count] = line_type;
+            self.count += 1;
+        } else {
+            for i in 1..MAX_LINES {
+                self.lines[i - 1] = self.lines[i];
+                self.lens[i - 1] = self.lens[i];
+                self.types[i - 1] = self.types[i];
+            }
+            self.lines[MAX_LINES - 1] = *line;
+            self.lens[MAX_LINES - 1] = len;
+            self.types[MAX_LINES - 1] = line_type;
+        }
+        self.scroll = usize::MAX;
+    }
+
+    pub fn scroll_up(&mut self, fb: &Framebuffer) {
+        if !self.visible { return; }
+        let max_scroll = self.max_scroll(fb);
+        let cur = if self.scroll == usize::MAX { max_scroll } else { self.scroll.min(max_scroll) };
+        self.scroll = cur.saturating_sub(1);
+        self.redraw(fb);
+    }
+
+    pub fn scroll_down(&mut self, fb: &Framebuffer) {
+        if !self.visible { return; }
+        let max_scroll = self.max_scroll(fb);
+        let cur = if self.scroll == usize::MAX { max_scroll } else { self.scroll.min(max_scroll) };
+        if cur >= max_scroll {
+            self.scroll = usize::MAX;
+        } else {
+            self.scroll = cur + 1;
+        }
+        self.redraw(fb);
+    }
+
+    pub fn redraw(&self, fb: &Framebuffer) {
+        if !self.visible { return; }
+        
+        let (x, y, w, h) = self.rect(fb);
+        let ui = system::ui_settings();
+        
+        // Покращена кольорова палітра з легкою прозорістю (якщо підтримується)
+        let (bg, input_bg, border, prompt) = if ui.dark {
+            (0xEE1A1A1A, 0x00252525, 0x00333333, ui.accent)
+        } else {
+            (0xEEFDFDFD, 0x00F0F0F0, 0x00D0D0D0, ui.accent)
+        };
+        
+        let chrome = window::draw_window(fb, x, y, w, h, b"Terminal");
+        display::fill_rect(fb, chrome.content_x, chrome.content_y, chrome.content_w, chrome.content_h, bg);
+
+        let text_x = chrome.content_x + PAD;
+        let input_h = LINE_HEIGHT + 10;
+        let input_area_y = chrome.content_y + chrome.content_h - input_h - 6;
+        
+        // Вивід історії
+        let max_visible = (input_area_y - chrome.content_y - PAD) / LINE_HEIGHT;
+        let max_scroll = self.count.saturating_sub(max_visible);
+        let start = if self.scroll == usize::MAX {
+            max_scroll
+        } else {
+            self.scroll.min(max_scroll)
+        };
+        let mut writer = crate::TextWriter::new(*fb);
+
+        let rows = (self.count - start).min(max_visible);
+        for i in 0..rows {
+            let idx = start + i;
+            draw_console_line(
+                &mut writer,
+                self.types[idx],
+                &self.lines[idx][..self.lens[idx]],
+                text_x,
+                chrome.content_y + PAD + i * LINE_HEIGHT,
+                ui.dark,
+                ui.accent,
+            );
+        }
+
+        if max_scroll > 0 {
+            let (sx, sy, sw, sh, _) = self.scrollbar_rect(fb);
+            draw_scrollbar(fb, sx, sy, sw, sh, start, max_scroll, max_visible, self.count, ui.dark, prompt);
+        }
+
+        // Поле вводу (Styled)
+        let input_box_x = chrome.content_x + 6;
+        let input_box_w = chrome.content_w - 12;
+        display::fill_rect(fb, input_box_x, input_area_y, input_box_w, input_h, input_bg);
+        draw_border(fb, input_box_x, input_area_y, input_box_w, input_h, border);
+
+        // Текст вводу
+        let input_text_y = input_area_y + (input_h - 10) / 2;
+        writer.set_color(prompt);
+        writer.set_pos(text_x, input_text_y);
+        writer.write_bytes(b"> ");
+        
+        writer.set_color(if ui.dark { 0x00FFFFFF } else { 0x000000 });
+        writer.write_bytes(&self.input[..self.input_len]);
+
+        // Активний курсор
+        let cursor_x = text_x + 18 + (self.input_len * 8);
+        if cursor_x < input_box_x + input_box_w - 4 {
+            display::fill_rect(fb, cursor_x, input_text_y, 2, 12, prompt);
+        }
+    }
+
+    pub fn rect(&self, fb: &Framebuffer) -> (usize, usize, usize, usize) {
+        if self.win_w == 0 { calc_rect(fb) } else { (self.win_x, self.win_y, self.win_w, self.win_h) }
+    }
+
+    pub fn set_pos(&mut self, x: usize, y: usize) { (self.win_x, self.win_y) = (x, y); }
+
+    pub fn set_rect(&mut self, x: usize, y: usize, w: usize, h: usize) {
+        self.win_x = x;
+        self.win_y = y;
+        self.win_w = w;
+        self.win_h = h;
+    }
+
+    fn max_scroll(&self, fb: &Framebuffer) -> usize {
+        let (_, y, _, h) = self.rect(fb);
+        let content_y = y + window::HEADER_H;
+        let content_h = h.saturating_sub(window::HEADER_H + 1);
+        let input_h = LINE_HEIGHT + 10;
+        let input_area_y = content_y + content_h - input_h - 6;
+        let max_visible = (input_area_y.saturating_sub(content_y + PAD)) / LINE_HEIGHT;
+        self.count.saturating_sub(max_visible)
+    }
+
+    fn scrollbar_rect(&self, fb: &Framebuffer) -> (usize, usize, usize, usize, usize) {
+        let (x, y, w, h) = self.rect(fb);
+        let content_x = x + 1;
+        let content_y = y + window::HEADER_H;
+        let content_w = w.saturating_sub(2);
+        let content_h = h.saturating_sub(window::HEADER_H + 1);
+        let input_h = LINE_HEIGHT + 10;
+        let input_area_y = content_y + content_h - input_h - 6;
+        let list_h = input_area_y.saturating_sub(content_y + PAD);
+        let max_visible = list_h / LINE_HEIGHT;
+        let max_scroll = self.count.saturating_sub(max_visible);
+        (
+            content_x + content_w.saturating_sub(PAD + SCROLL_W),
+            content_y + PAD,
+            SCROLL_W,
+            list_h,
+            max_scroll,
+        )
+    }
+}
+
+// --- Helpers (Без змін логіки, лише чистіший вигляд) ---
+
+fn get_line_color(t: LineType, dark: bool) -> u32 {
+    match (t, dark) {
+        (LineType::Success, true) => 0x0088FF88,
+        (LineType::Success, false) => 0x0000AA00,
+        (LineType::Error, true) => 0x00FF7777,
+        (LineType::Error, false) => 0x00AA0000,
+        (LineType::Info, true) => 0x0077CCFF,
+        (LineType::Info, false) => 0x000066CC,
+        (LineType::CommandHelp, true) => 0x0077CCFF,
+        (LineType::CommandHelp, false) => 0x000066CC,
+        (_, true) => 0x00DDDDDD,
+        (_, false) => 0x00222222,
+    }
+}
+
+fn draw_console_line(
+    writer: &mut crate::TextWriter,
+    line_type: LineType,
+    line: &[u8],
+    x: usize,
+    y: usize,
+    dark: bool,
+    accent: u32,
+) {
+    writer.set_pos(x, y);
+    if line_type != LineType::CommandHelp {
+        writer.set_color(get_line_color(line_type, dark));
+        writer.write_bytes(line);
+        return;
+    }
+
+    let split = find_help_separator(line);
+    let (command, rest) = match split {
+        Some(pos) => (&line[..pos], &line[pos..]),
+        None => (line, &line[0..0]),
+    };
+    let command_color = if dark { 0x008AD8FF } else { accent };
+    let dash_color = if dark { 0x006A7685 } else { 0x006B7A8F };
+    let desc_color = if dark { 0x00D9E1EC } else { 0x002B3442 };
+
+    writer.set_color(command_color);
+    writer.write_bytes(command);
+    if !rest.is_empty() {
+        writer.set_color(dash_color);
+        writer.write_bytes(b" - ");
+        writer.set_color(desc_color);
+        writer.write_bytes(&rest[3..]);
+    }
+}
+
+fn find_help_separator(line: &[u8]) -> Option<usize> {
+    if line.len() < 3 {
+        return None;
+    }
+    let mut i = 0usize;
+    while i + 2 < line.len() {
+        if line[i] == b' ' && line[i + 1] == b'-' && line[i + 2] == b' ' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn draw_border(fb: &Framebuffer, x: usize, y: usize, w: usize, h: usize, color: u32) {
+    display::fill_rect(fb, x, y, w, 1, color);
+    display::fill_rect(fb, x, y + h - 1, w, 1, color);
+    display::fill_rect(fb, x, y, 1, h, color);
+    display::fill_rect(fb, x + w - 1, y, 1, h, color);
+}
+
+fn draw_scrollbar(
+    fb: &Framebuffer,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    scroll: usize,
+    max_scroll: usize,
+    visible_rows: usize,
+    total_rows: usize,
+    dark: bool,
+    accent: u32,
+) {
+    if w == 0 || h == 0 || total_rows == 0 {
+        return;
+    }
+    let track = if dark { 0x0021262E } else { 0x00E8EFF8 };
+    let edge = if dark { 0x00414B57 } else { 0x00C4D2E2 };
+    display::fill_rect(fb, x, y, w, h, track);
+    display::fill_rect(fb, x, y, w, 1, edge);
+    display::fill_rect(fb, x, y + h.saturating_sub(1), w, 1, edge);
+    let thumb_h = ((visible_rows.max(1) * h) / total_rows.max(1)).max(18).min(h);
+    let thumb_y = if max_scroll == 0 {
+        y
+    } else {
+        y + ((scroll.min(max_scroll) * h.saturating_sub(thumb_h)) / max_scroll)
+    };
+    display::fill_rect(fb, x + 2, thumb_y + 2, w.saturating_sub(4), thumb_h.saturating_sub(4), accent);
+    display::fill_rect(fb, x + 3, thumb_y + 3, w.saturating_sub(6), 1, 0x00FFFFFF);
+}
+
+fn calc_rect(fb: &Framebuffer) -> (usize, usize, usize, usize) {
+    let w = (fb.width * 6) / 10;
+    let h = (fb.height * 6) / 10;
+    ((fb.width - w) / 2, (fb.height - h) / 2, w, h)
+}
+
+fn split_first_word(buf: &[u8], len: usize) -> (&[u8], &[u8]) {
+    let s = buf[..len].iter().position(|&b| b != b' ').unwrap_or(len);
+    let e = buf[s..len].iter().position(|&b| b == b' ').map(|p| p + s).unwrap_or(len);
+    let next = buf[e..len].iter().position(|&b| b != b' ').map(|p| p + e).unwrap_or(len);
+    (&buf[s..e], &buf[next..len])
+}
+
+fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(&ac, &bc)| ac.to_ascii_lowercase() == bc.to_ascii_lowercase())
+}
