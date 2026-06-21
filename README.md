@@ -10,7 +10,7 @@ HouseOS is an experimental operating system built from scratch using Rust and As
 ## 📥 Download
 
 * 💿 **HouseOS.iso**
-* [![Download ISO](https://img.shields.io/badge/Download-HouseOS_ISO-success?style=for-the-badge)](ПОСИЛАННЯ_НА_ISO)
+* [![Download ISO](https://img.shields.io/badge/Download-HouseOS_ISO-success?style=for-the-badge)](https://github.com/MychailoMisha/HouseOS-Release/blob/main/build/houseos.iso)
 * 📦 **HouseOS.zip**
 
 ## 📜 Development History
